@@ -1,2 +1,4 @@
 data/stock_data.csv
 data\pivoted_log_return.csv
+__pycache__
+.vscode

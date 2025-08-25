@@ -116,7 +116,11 @@ class LSTM_BEKK_MODEL:
             n_periods, n_assets = returns.shape
             assert n_assets == self.n_assets
 
-            x = returns.unsqueeze(0) # Add new dimension at the beginning to (1, T, M) to be suitable with torch
+            # FIX: build inputs = [0, r_0, r_1, ..., r_{T-2}] so that output at index t uses r_{t-1}
+            zeros = torch.zeros(1, n_assets, dtype=returns.dtype, device=returns.device)
+            inputs = torch.cat([zeros, returns[:-1, :]], dim=0)  # shape (T, M)
+
+            x = inputs.unsqueeze(0) # Add new dimension at the beginning to (1, T, M) to be suitable with torch
             h, _ = self.lstm(x) # (1, T, H)
             z = self.out(h) # (1, T, L)
             z = z.squeeze(0) # (T, L)
@@ -168,7 +172,7 @@ class LSTM_BEKK_MODEL:
         val_split: float = 0.1
         early_stopping_patience: int = 20
         device: str = "cpu"
-        jitter: float = 1e-8 # for Cholesky stability
+        jitter: float = 1e-6 # for Cholesky stability
         seed: int = 1
 
     class LSTM_BEKK(nn.Module):
@@ -329,7 +333,8 @@ class LSTM_BEKK_MODEL:
                 dtype=torch.float64,
                 device=device
             )
-            self.init_cov_matrix = cov.detach()
+            # self.init_cov_matrix = cov.detach()
+            self.H0_ = cov.detach()
 
             params = list(self.parameters())
             opt = RMSprop(params, lr=config.lr, weight_decay=config.weight_decay)
@@ -472,11 +477,11 @@ class LSTM_BEKK_MODEL:
                     # sample one return path
                     L = torch.linalg.cholesky(H_next)
                     z = torch.randn(n_assets, 1, dtype=torch.float64, device=device)
-                    r_curr (L @ z).T 
+                    r_curr = (L @ z).T 
             
             return np.stack(forecasts, axis=0)
         
-    def fit_lstm_bekk(
+    def fit_lstm_(
             returns_df: pd.DataFrame,
             hidden_size: Optional[int] = None,
             num_layers: int = 1,
