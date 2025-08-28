@@ -14,11 +14,11 @@ def stein_loss(H_true: np.ndarray, H_pred: np.ndarray) -> float:
     tr(H_true^{-1} H_pred) - log det(H_true^{-1} H_pred) - n
     """
     n = H_true.shape[0]
-    try:
-        inv_H = np.linalg.inv(H_true)
-    except np.linalg.LinAlgError:
-        # add jitter for numerical stability
-        inv_H = np.linalg.inv(H_true + 1e-8 * np.eye(n))
+    # try:
+    #     inv_H = np.linalg.inv(H_true)
+    # except np.linalg.LinAlgError:
+    #     # add jitter for numerical stability
+    inv_H = np.linalg.inv(H_true + 1e-8 * np.eye(n))
 
     A = inv_H @ H_pred
     loss = np.trace(A) - np.log(np.linalg.det(A)) - n

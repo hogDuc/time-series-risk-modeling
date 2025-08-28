@@ -8,6 +8,9 @@ from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
 import pandas as pd
 import math
+from sklearn.svm import SVR
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
 
 class LSTM_BEKK_MODEL:
 
@@ -481,7 +484,7 @@ class LSTM_BEKK_MODEL:
             
             return np.stack(forecasts, axis=0)
         
-    def fit_lstm_(
+    def fit_lstm_bekk(
             returns_df: pd.DataFrame,
             hidden_size: Optional[int] = None,
             num_layers: int = 1,
@@ -574,18 +577,18 @@ class BEKK_GARCH_MODEL:
 
         return C, A, B, bekk
 
-    def bekk_forecast(C, A, B, returns, horizon=20):
+    def bekk_forecast(C, A, B, returns, horizon=1):
         n_periods, n_assets = returns.shape
         last_cov_matrix = np.cov(returns.T)
         residual = returns[-1].reshape(-1,1)
         forecasts = []
 
-        cov_matrix_f1 = C@C.T + A@(residual@residual.T)@A.T + B@last_cov_matrix@B.T
+        cov_matrix_f1 = C @ C.T + A @ (residual @ residual.T) @ A.T + B @ last_cov_matrix @ B.T
         forecasts.append(cov_matrix_f1) # Use actual shocks
 
         prev_cov_matrix = cov_matrix_f1.copy()
         for t in range(2, horizon+1):
-            cov_matrix_t = C@C.T + (A@A.T + B@B.T)@prev_cov_matrix
+            cov_matrix_t = C @ C.T + (A @ A.T + B @ B.T) @ prev_cov_matrix
             forecasts.append(cov_matrix_t)
             prev_cov_matrix = cov_matrix_t
         
@@ -860,7 +863,7 @@ class DCC_GARCH_MODEL:
     def forecast_dcc_multi_step(
             h_last, r_last, garch_params,
             eps_last, Q_last, dcc_params, S,
-            horizon=20
+            horizon=1
         ):
         """
         Multi-step forecast of conditional covariance matrices under DCC-GARCH(1,1).
@@ -954,3 +957,198 @@ class DCC_GARCH_MODEL:
             variance_forecast[j] = omega + alpha*(r_last[j]**2) + beta*h_last[j]
 
         return variance_forecast
+
+
+class SVR_MODEL:
+    def parkinson_variance(high, low):
+        """
+        Parkinson variance estimator with high and low prices
+        var_{Pt} = [ln(H_t/L_t)^2]/(4*ln2)
+        """
+        return (np.log(high/low)**2) / (4*np.log(2))
+
+    def range_based_covariance_matrix(data:pd.DataFrame) -> pd.DataFrame:
+        """
+        Compute range-based covariance matrix for multiple assets
+        Args:
+            data: TxM dataframe in MultiIndex format (asset, price_type). Example: ('HPG', 'high), ('HPG', 'low'),...
+        Returns:
+            Range-based covariance matrix for multiple assets
+        """
+
+        tickers = data.columns.get_level_values(0).unique(0)
+        n_assets = len(tickers)
+        cov_matrices = {}
+
+        for date, row in data.iterrows():
+            variances = {}
+            for asset in tickers:
+                high_price, low_price = row[asset, 'high'], row[asset, 'low']
+                variances[asset] = SVR_MODEL.parkinson_variance(high_price, low_price)
+
+            cov_matrix = pd.DataFrame(
+                np.zeros((n_assets, n_assets)),
+                index=tickers,
+                columns=tickers
+            ) # Initialize covariance matrix
+
+            # Fill diagonal with variances estimated with Parkinson
+            for asset in tickers:
+                cov_matrix.loc[asset, asset] = variances[asset]
+
+            # Off-diagonals
+            for i, asset_i in enumerate(tickers):
+                for j, asset_j in enumerate(tickers):
+                    if j>i: # Only get the upper triangular
+                        high_sum = row[asset_i, "high"] + row[(asset_j, 'high')]
+                        low_sum = row[asset_i, "low"] + row[asset_j, 'low']
+                        var_sum = SVR_MODEL.parkinson_variance(high_sum, low_sum)
+
+                        cov = 0.5 * (var_sum - variances[asset_i] - variances[asset_j])
+                        cov_matrix.loc[asset_i, asset_j] = cov
+                        cov_matrix.loc[asset_j, asset_i] = cov
+                    
+            cov_matrices[date] = cov_matrix
+        
+        return cov_matrices
+
+    def cholesky_decomposition(
+        G: np.ndarray,
+        tol=1e-12,
+        jitter_start=1e-12,
+        jitter_max=1e-3
+    ):
+        # Symmetrize
+        Gs = 0.5 * (G + G.T)
+
+        try:
+            upper_triang = np.linalg.cholesky(Gs, upper=True)
+            # return upper_triang
+        except np.linalg.LinAlgError:
+            # Eigenvalue correction
+            w, Q = np.linalg.eigh(Gs)
+            w_clipped = np.maximum(w, tol)
+            G_corr = (Q * w_clipped) @ Q.T
+
+            try:
+                upper_triang = np.linalg.cholesky(G_corr, upper=True)
+                # return upper_triang
+            except np.linalg.LinAlgError:
+                # Final fallback: escalating diagonal jitter
+                jitter = jitter_start
+                I = np.eye(G.shape[0])
+                while jitter <= jitter_max:
+                    try:
+                        upper_triang = np.linalg.cholesky(G_corr + jitter * I, upper=True)
+                        # return upper_triang
+                    except np.linalg.LinAlgError:
+                        jitter *= 10.0
+                raise np.linalg.LinAlgError("Cholesky failed: matrix far from positive definite even after eigenvalue clipping and jitter")
+        
+        return upper_triang
+    # Step 3: For each entry of the cholesky factor, construct and train the autoregressive SVR model
+
+    def get_cholesky_series(chol_factors):
+        dates = list(chol_factors.keys())
+        P0 = chol_factors[dates[0]] # The first upper triangular matrix
+        assets = P0.columns
+        series_dict = {}
+        n_assets = len(assets)
+
+        for i in range(n_assets):
+            for j in range(i, n_assets):
+                series_dict[(i, j)] = pd.Series(
+                    [chol_factors[d].iloc[i, j] for d in dates],
+                    index=dates
+                )
+        
+        return series_dict
+
+    def fit_SVR(series, lags=15):
+        """
+        Fit SVR to Cholesky entry
+        Returns:
+            Fitted series
+        """
+        y = series.values
+        X = np.column_stack([np.roll(y, k) for k in range(1, lags + 1)])
+        X, y = X[lags:], y[lags:]
+        model = make_pipeline(
+            StandardScaler(),
+            SVR(kernel='rbf', C=1.0, epsilon=0.01)
+        )
+        model.fit(X, y)
+
+        return model
+
+    def forecast_svr(model, hist, steps=1, lags=15):
+        """
+        Forecast with SVR
+        Args:
+            model: Fitted SVR model
+            hist: Historical data
+            steps: Forecast steps
+            lags: Days to input into training
+        Returns Cholesky entries
+        """
+        
+        preds = []
+        h = hist.copy()
+        for _ in range(steps):
+            x = h[-lags:].reshape(1, -1)
+            pred = model.predict(x)[0]
+            preds.append(pred)
+            h = np.append(h, pred)
+        
+        return preds
+
+    def forecast_covariance(chol_factors, horizon=1, lags=20):
+        series_dict = SVR_MODEL.get_cholesky_series(chol_factors)
+        models = {
+            k: SVR_MODEL.fit_SVR(v, lags=lags) for k, v in series_dict.items()
+        }
+        forecasts = {
+            k: SVR_MODEL.forecast_svr(models[k], series_dict[k].values
+        , steps=horizon, lags=lags) for k in series_dict.keys()
+        }
+        n_assets = len(chol_factors[next(iter(chol_factors))]) # number of assets
+        pred_covs = []
+        for step in range(horizon):
+            # Build forecasted P_t
+            P_fc = np.zeros((n_assets, n_assets)) # Initialize matrix
+            for (i, j), vals in forecasts.items():
+                P_fc[i, j] = vals[step]
+            
+            # Covariance forecast
+            G_fc = P_fc.T @ P_fc
+            pred_covs.append(G_fc)
+        
+        return pred_covs
+
+    def svr_model_forecast(
+            train_data, 
+            horizon=1, 
+            lags=30
+        ):
+
+        cov_matrices = SVR_MODEL.range_based_covariance_matrix(train_data)
+
+        # Step 2: The matrices are decomposed using Cholesky decomposition in the form G_t = P_t' P_t
+        # This is to ensure the covariance matrix is always positive definite
+        chol_factors = {}
+        for date, cov in cov_matrices.items():
+            upper_triang = SVR_MODEL.cholesky_decomposition(cov.values)
+            chol_factors[date] = pd.DataFrame(
+                upper_triang,
+                index=cov.index,
+                columns=cov.columns
+            )
+
+        # Step 3: Predict covariances
+        pred_covs = SVR_MODEL.forecast_covariance(
+            chol_factors=chol_factors,
+            horizon=horizon,
+            lags=lags # Experiment to find the best lags
+        )
+
+        return pred_covs
