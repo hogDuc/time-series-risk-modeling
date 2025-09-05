@@ -92,3 +92,13 @@ def minimum_variance_portfolio(covariance_matrix, data):
     return optimal_weights.x, {
         str(col): float(optimal_weights.x[i]) for i, col in enumerate(data.columns)
     }
+
+def sharpe_ratio(
+    returns: np.array,
+    rf_rate = 0.032 # Risk-free rate
+):
+    mean_return = np.mean(returns)
+    volatility = np.std(returns, ddof=1)
+    sharpe = (mean_return - rf_rate)/volatility
+
+    return sharpe

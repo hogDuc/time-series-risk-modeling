@@ -8,21 +8,34 @@ def frobenius_loss(H_true: np.ndarray, H_pred: np.ndarray) -> float:
     return np.linalg.norm(diff, ord="fro")**2
 
 
-def stein_loss(H_true: np.ndarray, H_pred: np.ndarray) -> float:
-    """
-    Stein loss (a likelihood-based measure):
-    tr(H_true^{-1} H_pred) - log det(H_true^{-1} H_pred) - n
-    """
+def stein_loss(H_true, H_pred, eps=1e-6):
     n = H_true.shape[0]
-    # try:
-    #     inv_H = np.linalg.inv(H_true)
-    # except np.linalg.LinAlgError:
-    #     # add jitter for numerical stability
-    inv_H = np.linalg.inv(H_true + 1e-8 * np.eye(n))
+    
+    H_true = (H_true + H_true.T) * 0.5
+    H_pred = (H_pred + H_pred.T) * 0.5
+    H_true_reg = H_true + eps * np.eye(n)
 
-    A = inv_H @ H_pred
-    loss = np.trace(A) - np.log(np.linalg.det(A)) - n
-    return np.real(loss)
+    A = np.linalg.solve(H_true_reg, H_pred)
+    sign, logdet = np.linalg.slogdet(A)
+    if sign <= 0:
+        return np.inf
+
+    return float(np.trace(A) - logdet - n)
+
+
+def stein_loss_scaled(H_true, H_pred, eps=1e-6):
+    n = H_true.shape[0]
+    H_true = (H_true + H_true.T) / 2
+    H_pred = (H_pred + H_pred.T) / 2
+    H_true_reg = H_true + eps * np.eye(n)
+
+    # optimal scaling
+    trPTinv = np.trace(H_pred @ np.linalg.inv(H_true_reg))
+    alpha = n / (trPTinv + 1e-12)
+    H_pred_scaled = alpha * H_pred
+    
+    return stein_loss(H_true, H_pred_scaled, eps)
+
 
 
 def correlation_loss(H_true: np.ndarray, H_pred: np.ndarray, fisher_z: bool = False) -> float:
