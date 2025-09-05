@@ -1,8 +1,9 @@
 import torch.nn as nn
 import torch
+import torch.optim as optim
 from torch.optim import RMSprop
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, NonlinearConstraint
 from tqdm import tqdm
 from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
@@ -12,513 +13,433 @@ from sklearn.svm import SVR
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
 from numpy.lib.stride_tricks import sliding_window_view
+import math
+from dataclasses import dataclass
+import os
+from datetime import datetime
+from torch.utils.data import Dataset, DataLoader
+import warnings
+
+warnings.filterwarnings("ignore")
+
 
 class LSTM_BEKK_MODEL:
 
-    def to_tensor(x, device):
-        if isinstance(x, np.ndarray):
-            return torch.from_numpy(x).to(device=device, dtype=torch.float64)
-        if isinstance(x, torch.Tensor):
-            return x.to(device=device, dtype=torch.float64)
-        raise TypeError("Unsupported array type")
-
-    def lower_triangle_index(n_assets: int):
-        '''
-        Get index of lower triangular matrix
-        '''
-        rows, cols = torch.tril_indices(n_assets, n_assets)
-        diag_mask = rows == cols
-        off_mask = ~diag_mask
-        return rows, cols, diag_mask, off_mask
-
-    def vec_to_lower_tri(vec: torch.Tensor, n_assets: int) -> torch.Tensor:
+    class LSTMBEKKModel(nn.Module):
         """
-        Map vector of length n_assets(n_assets+1)/2 to a lower-triangular matrix
-        Args:
-            vec: shape (..., n_assets(n_assets+1)/2)
-        Output:
-            shapeL (..., n_assets,n_assets)
+        LSTM-BEKK model for multivariate volatility modeling
         """
+        def __init__(
+            self,
+            n_assets,
+            hidden_size=None,
+            num_layers=3,
+            dropout=0.1,
+            beta=1.0
+        ):
+            """
+            Initialize LSTM-BEKK Model
+            Args: 
+                n_assets: Number of stocks in the portfolio
+                hidden_size: LSTM hidden size, recommended to set as equal to the number of stocks
+                num_layers: Number of LSTM layers. Recommended 3-5
+                dropout: Dropout rate for regularization. Recommended 0.1-0.2
+                beta: Swish activation parameter
+            """
+            super(LSTM_BEKK_MODEL.LSTMBEKKModel, self).__init__()
 
-        vec_length = n_assets * (n_assets + 1) // 2
-        assert vec.shape[-1] == vec_length, f"Expected vector length {vec_length} for number of assets = {n_assets}, got {vec.shape[-1]}"
-        rows, cols, _, _ = LSTM_BEKK_MODEL.lower_triangle_index(n_assets)
-        out = vec.new_zeros(*vec.shape[:-1], n_assets, n_assets) # Initialize
-        out[..., rows, cols] = vec
-
-        return out
-
-    class Static_C(nn.Module):
-        '''
-        Parameterization of the static lower-triangular C with positive diagonal to ensure semipositive definitenes of C'C
-        '''
-        def __init__(self, n_assets: int):
-            super().__init__()
             self.n_assets = n_assets
-            self.off_idx = torch.tril_indices(n_assets, n_assets, offset=-1)
-            num_off = self.off_idx.shape[1]
-            
-            self.off_params = nn.Parameter(
-                torch.zeros(num_off, dtype=torch.float64)
-            )
-            self.diag_params = nn.Parameter(
-                torch.zeros(n_assets, dtype=torch.float64)
-            )
-        
-        def forward(self) -> torch.Tensor:
-            C = self.off_params.new_zeros(self.n_assets, self.n_assets)
-            # Off diagonals parameteres
-            C[self.off_idx[0], self.off_idx[1]] = self.off_params
-            # Diagonal parameteres
-            C[range(self.n_assets), range(self.n_assets)] = torch.nn.functional.softplus(self.diag_params) + 1e-6
-
-            return C
-
-    class LSTM_Dynamic_C(nn.Module):
-        """
-        Map past returns to dynamic element C_t, map LSTM output to lower triangular matrix C_t, and regularize the diagonal with a Swish function Swish(x) = x*sigmopoid(Beta*x), with learnable x.
-        The Swish function helps stability without forcing diagonals strictly positive
-        """
-
-        def __init__(self, n_assets: int, hidden_size: Optional[int] = None, num_layers: int = 1, dropout:float = 0.1):
-            super().__init__()
-            self.n_assets = n_assets
-            self.length = n_assets * (n_assets + 1) // 2
-            self.hidden_size = hidden_size or max(8, n_assets) # At least equal to number of assets
+            self.hidden_size = hidden_size or n_assets
             self.num_layers = num_layers
+            self.beta = nn.Parameter(torch.tensor(beta))
 
-            # LSTM that takes in r_{t-1} and outputs a vector length = self.length at each step
+            # Static lower triangular matrix C
+            self.C = nn.Parameter(torch.randn(n_assets, n_assets))
+
+            # Scalar parameters for BEKK component
+            self.log_a = nn.Parameter(torch.tensor(-3.0))
+            self.log_b = nn.Parameter(torch.tensor(-0.1))
+
+            # LSTM network for dynamic component
             self.lstm = nn.LSTM(
                 input_size=n_assets,
                 hidden_size=self.hidden_size,
                 num_layers=num_layers,
-                dropout=dropout if num_layers > 1 else 0.0,
-                batch_first=True,
-                dtype=torch.float64
+                batch_first=True, 
+                dropout=dropout if num_layers > 1 else 0
             )
 
-            self.out = nn.Linear(
-                self.hidden_size, 
-                self.length, 
-                dtype=torch.float64
-            )
-            self.beta = nn.Parameter(torch.tensor(1.0, dtype=torch.float64)) # Swish parameters beta, is learnable
+            # Output layer to generate lower triangular matrix element
+            n_lower_triangular = n_assets * (n_assets + 1) // 2
+            self.output_layer = nn.Linear(self.hidden_size, n_lower_triangular)
 
-        def swish(self, x: torch.Tensor) -> torch.Tensor:
-            # Swish(x) = x * sigmoid(beta * x)
+        def swish_activation(self, x):
+            '''Swish activation function: x * sigmoid(beta * x)'''
             return x * torch.sigmoid(self.beta * x)
+        
+        def make_lower_triangular(self, vec):
+            '''
+            Convert vector to lower triangular matrix using completely functional approach
+            '''
+            batch_size = vec.shape[0]
+            n = self.n_assets
+            device = vec.device
+            
+            L = torch.zeros(batch_size, n, n, device=device) # Initialize lower-triangular matrix
 
-        def forward(self, returns: torch.Tensor) -> torch.Tensor:
+            k = 0
+            for i in range(n):
+                for j in range(i + 1):
+                    L[:, i, j] = vec[:, k]
+                    k += 1
+
+            # Create position encodings for lower triangular matrix
+            positions = []
+            for i in range(n):
+                for j in range(i + 1):
+                    positions.append((i, j))
+            
+            # Apply Swish activation to diagonal elements
+            diag_elements = torch.diagonal(L, dim1=1, dim2=2)
+            active_L = L.clone()
+            for i in range(n):
+                active_L[:, i, i] = self.swish_activation(diag_elements[:, i])
+
+            return active_L
+        
+        def get_static_C(self):
+            """Get static lower triangular matrix C"""
+            # Make lower triangular
+            C_lower = torch.tril(self.C)
+            
+            # Ensure positive diagonal elements using functional approach
+            diag_values = torch.diagonal(C_lower, dim1=-2, dim2=-1)
+            abs_diag_values = torch.abs(diag_values) + 1e-6
+            
+            # Create diagonal matrix
+            diag_matrix = torch.diag_embed(abs_diag_values)
+            
+            # Create off-diagonal part
+            off_diag = C_lower - torch.diag_embed(diag_values)
+            
+            # Combine
+            result = off_diag + diag_matrix
+            
+            return result
+        
+        def get_bekk_params(self):
+            """Get positive BEKK parameters with stationarity constraint"""
+            a = torch.exp(self.log_a)
+            b = torch.exp(self.log_b)
+
+            # Ensure stationarity: a + b < 1
+            total = a + b
+            scale_factor = torch.where(total >= 0.999, 0.998 / total, torch.tensor(1.0, device=total.device))
+            
+            a_scaled = a * scale_factor
+            b_scaled = b * scale_factor
+
+            return a_scaled, b_scaled
+
+        def forward(self, returns):
             """
+            Forward pass using completely functional approach
+            """
+            batch_size, seq_len, n_assets = returns.shape
+            device = returns.device
+
+            if seq_len == 0:
+                empty_cov = torch.zeros(batch_size, 0, n_assets, n_assets, device=device)
+                return empty_cov, torch.tensor(0.0, device=device)
+
+            # Get static components
+            C_static = self.get_static_C()
+            CC_static = torch.mm(C_static, C_static.t())
+            a, b = self.get_bekk_params()
+
+            # LSTM forward pass
+            lstm_out, _ = self.lstm(returns)
+            C_t_vec = self.output_layer(lstm_out)
+
+            # Generate dynamic matrices
+            # Reshape for batch processing
+            C_t_vec_reshaped = C_t_vec.view(-1, C_t_vec.shape[-1])
+            C_t_matrices_flat = self.make_lower_triangular(C_t_vec_reshaped)
+            C_t_matrices = C_t_matrices_flat.view(batch_size, seq_len, n_assets, n_assets)
+
+            # Process sequence using functional approach
+            all_H = []
+            all_nll = []
+            
+            # Initial H
+            H_current = CC_static.unsqueeze(0).expand(batch_size, -1, -1).contiguous()
+            
+            for t in range(seq_len):
+                # Get current dynamic component
+                C_t = C_t_matrices[:, t]
+                CC_dynamic = torch.bmm(C_t, C_t.transpose(-2, -1))
+
+                # BEKK component
+                if t > 0:
+                    r_prev = returns[:, t-1].unsqueeze(-1)
+                    rr_prev = torch.bmm(r_prev, r_prev.transpose(-2, -1))
+                    bekk_term = a * rr_prev + b * H_current
+                else:
+                    bekk_term = b * H_current
+
+                # Compute new H
+                H_new = CC_static.unsqueeze(0) + CC_dynamic + bekk_term
+                
+                # Add regularization
+                reg_term = torch.eye(n_assets, device=device) * 1e-6
+                H_new = H_new + reg_term.unsqueeze(0)
+                
+                all_H.append(H_new)
+
+                # Compute likelihood
+                try:
+                    L = torch.linalg.cholesky(H_new)
+                    log_det = 2 * torch.sum(torch.log(torch.diagonal(L, dim1=-2, dim2=-1)), dim=-1)
+                    
+                    r_t = returns[:, t].unsqueeze(-1)
+                    y = torch.triangular_solve(r_t, L, upper=False)[0]
+                    quad_form = torch.sum(y ** 2, dim=(-2, -1))
+                    
+                    nll_t = 0.5 * (log_det + quad_form)
+                    all_nll.append(torch.mean(nll_t))
+                    
+                except Exception as e:
+                    print(f"Cholesky failed at t={t}: {e}")
+                    all_nll.append(torch.tensor(1e6, device=device))
+
+                # Update H_current - create completely new tensor
+                H_current = H_new.clone().detach()
+
+            # Combine results
+            covariance_matrices = torch.stack(all_H, dim=1)
+            total_nll = sum(all_nll) if all_nll else torch.tensor(0.0, device=device)
+            
+            return covariance_matrices, total_nll
+
+        def forecast(self, past_returns, n_steps=20, sampling=False):
+            """
+            Multi-step ahead forecast
             Args:
-                returns: TxM returns
-            Outputs:
-                C_t for t = 1,... T shape (T, M, M)
-            Convention: at step t we feed r_{t-1}, for t=0 we won't form C_0
+                past_returns: Tensor (1, seq_len, n_assets)
+                n_steps: number of steps ahead
+                sampling: if True, sample future returns, else assume zero mean
+            Returns:
+                forecasts: list of covariance matrices for n_steps
             """
 
-            n_periods, n_assets = returns.shape
-            assert n_assets == self.n_assets
+            self.eval()
+            device = past_returns.device
+            with torch.no_grad():
+                # Run LSTM to get dynamic component
+                lstm_out, (h_n, c_n) = self.lstm(past_returns)
+                hidden = lstm_out[:, -1:] # Last step hidden state
 
-            # FIX: build inputs = [0, r_0, r_1, ..., r_{T-2}] so that output at index t uses r_{t-1}
-            zeros = torch.zeros(1, n_assets, dtype=returns.dtype, device=returns.device)
-            inputs = torch.cat([zeros, returns[:-1, :]], dim=0)  # shape (T, M)
+                # Get static components
+                C_static = self.get_static_C()
+                CC_static = torch.mm(C_static, C_static.t())
+                a, b = self.get_bekk_params()
 
-            x = inputs.unsqueeze(0) # Add new dimension at the beginning to (1, T, M) to be suitable with torch
-            h, _ = self.lstm(x) # (1, T, H)
-            z = self.out(h) # (1, T, L)
-            z = z.squeeze(0) # (T, L)
-            C_full = LSTM_BEKK_MODEL.vec_to_lower_tri(z, self.n_assets)
+                # Last observed covariance
+                covariances, _ = self.forward(past_returns)
+                H_current = covariances[:, -1]
 
-            # Apply Swish to only diagonal elements
-            rows, cols, diag_mask, off_mask = LSTM_BEKK_MODEL.lower_triangle_index(self.n_assets)
-            diag_vals = C_full[..., rows[diag_mask], cols[diag_mask]] # Get all diagonal values
-            diag_vals = self.swish(diag_vals) # Apply Swish
-            C_full[..., rows[diag_mask], cols[diag_mask]] = diag_vals # Assign Swish-applied values to the lower-triangular matrix C
+                # Last observed return
+                r_prev = past_returns[:, -1]
 
-            return C_full # C_t
+                forecasts = []
+                for step in range(n_steps):
+                    # Dynamic matrix from hidden state
+                    C_vec = self.output_layer(hidden).view(-1, self.output_layer.out_features)
+                    C_mat = self.make_lower_triangular(C_vec)[0]
+                    CC_dynamic = C_mat @ C_mat.T
+
+                    rr_prev = r_prev @ r_prev.T
+                    H_new = CC_static + CC_dynamic + a * rr_prev + b * H_current
+                    H_new = H_new + torch.eye(self.n_assets, device=device) * 1e-6
+
+                    forecasts.append(H_new)
+
+                    # Update for next iteration
+                    H_current = H_new.clone()
+                    if sampling:
+                        r_prev = torch.distributions.MultivariateNormal(
+                            loc=torch.zeros(self.n_assets, device=device), covariance_matrix=H_new
+                        ).sample()
+                    else:
+                        r_prev = torch.zeros(self.n_assets, device=device)
+
+                    # Evolve LSTM hidden state with zero input
+                    zero_input = torch.zeros(1, 1, self.n_assets, device=device)
+                    hidden, (h_n, c_n) = self.lstm(zero_input, (h_n, c_n))
+
+                return forecasts
+
+    class ReturnDataset(Dataset):
+        """Dataset class for multivariate return data"""
+        def __init__(self, returns, seq_len=50):
+            self.returns = torch.tensor(returns, dtype=torch.float32)
+            self.seq_len = seq_len
+            self.T, self.n_assets = self.returns.shape
+
+        def __len__(self):
+            return max(0, self.T - self.seq_len + 1)
         
-    class params(nn.Module):
-        """
-        Static scalars a, b with constraints: a, b >= 0; a + b < 1
-        Use positive reparameterization via softplus -> normalize:
-            u = softplus(u0), v = softplus(v0); s = u + v + 1; a = u/s, b = v/s
-        Which makes a, b in (0,1) and a+b <1
-        """
+        def __getitem__(self, index):
+            return self.returns[index:index + self.seq_len]
 
-        def __init__(self):
-            super().__init__()
-            self.u0 = nn.Parameter(
-                torch.tensor(0.2, dtype=torch.float64)
+
+    class LSTMBEKKTrainer:
+        """Trainer class for LSTM-BEKK Model"""
+        
+        def __init__(self, model, learning_rate=0.001, weight_decay=1e-5):
+            self.model = model
+            self.optimizer = LSTM_BEKK_MODEL.optim.RMSprop(
+                model.parameters(),
+                lr=learning_rate,
+                weight_decay=weight_decay,
+                eps=1e-8
             )
-            self.v0 = nn.Parameter(
-                torch.tensor(0.7, dtype=torch.float64)
+            self.scheduler = LSTM_BEKK_MODEL.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer,
+                mode='min',
+                factor=0.5,
+                patience=10
             )
-        
-        def forward(self) -> Tuple[torch.Tensor, torch.Tensor]:
-            u = torch.nn.functional.softplus(self.u0)
-            v = torch.nn.functional.softplus(self.v0)
-            s = u + v + 1.0
-            a = u/s
-            b = v/s
-            return a, b
-        
 
-    @dataclass
-    class LSTM_BEKK_config:
-        hidden_size: Optional[int] = None
-        num_layers: int = 1
-        dropout: float = 0.1
-        lr: float = 0.001
-        weight_decay: float = 0.0
-        epochs: int = 500
-        grad_clip: float = 10.0
-        val_split: float = 0.1
-        early_stopping_patience: int = 20
-        device: str = "cpu"
-        jitter: float = 1e-6 # for Cholesky stability
-        seed: int = 1
+        def train_epoch(self, train_loader):
+            """Train for one epoch"""
 
-    class LSTM_BEKK(nn.Module):
-        """
-        H_t = C*C' + C_t*C_t' + a*r_{t-1}*r_{t-1}' + b*H_{t-1}
-        with Gaussian log-likelihood
-        """
+            self.model.train()
+            total_loss = 0.0
+            num_batches = 0
 
-        def __init__(self, n_assets: int, config: Optional["LSTM_BEKK_MODEL.LSTM_BEKK_config"]=None):
-            super().__init__()
-            self.n_assets = n_assets
-            self.config = config or LSTM_BEKK_MODEL.LSTM_BEKK_config()
-            torch.manual_seed(self.config.seed) # Set seed
+            for batch_idx, batch_returns in enumerate(train_loader):
+                batch_returns = batch_returns.to(next(self.model.parameters()).device)
 
-            self.C = LSTM_BEKK_MODEL.Static_C(n_assets)
-            self.C_dynamic = LSTM_BEKK_MODEL.LSTM_Dynamic_C(
-                n_assets=n_assets, 
-                hidden_size=self.config.hidden_size,
-                num_layers=self.config.num_layers,
-                dropout=self.config.dropout
-            )
-            self.ab = LSTM_BEKK_MODEL.params()
+                # Zero gradients
+                self.optimizer.zero_grad()
 
-            # Buffers created at fit-time 
-            # NOTE: wtf is this ==================================================================
-            self.H0_: Optional[torch.Tensor] = None
-            self.mu_: Optional[torch.Tensor] = None
+                try:
+                    # Forward pass
+                    _, loss = self.model(batch_returns)
+
+                    # Regularization
+                    reg_loss = torch.tensor(0.0, device=loss.device)
+                    for param in self.model.parameters():
+                        reg_loss = reg_loss + torch.sum(torch.abs(param))
+                    
+                    total_loss_batch = loss + 1e-6 * reg_loss
+                    
+                    # Backward pass
+                    total_loss_batch.backward()
+
+                    # Gradient clipping
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                    # Optimizer step
+                    self.optimizer.step()
+
+                    total_loss += loss.item()
+                    num_batches += 1
+
+                except Exception as error:
+                    print(f"Error in training batch {batch_idx}: {error}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
             
-            self.to(
-                dtype=torch.float64,
-                device=self.config.device
-            )
+            return total_loss / max(num_batches, 1)
         
-        def forward_sequence(
-                self,
-                returns: torch.Tensor,
-                init_cov_matrix: Optional[torch.Tensor]=None
-            ) -> Tuple[torch.Tensor, torch.Tensor]:
-            """
-            Implement the recursion for covariance matrix H_t. Compute covariance matrix H_t and per-step negative log-likelihood terms, given returns TxM
-            Output:
-                H: (T, M, M)
-                nll_terms: (T,) with 0.5 * (logdet(cov_matrix) + r_t' * cov_matrix **(-1)*r_t)
-            """
-            config = self.config
-            device = config.device
-            n_periods, n_assets = returns.shape
-            assert n_assets == self.n_assets
+        def validate(self, val_loader):
+            """Validate the model"""
+            self.model.eval()
+            total_loss = 0.0
+            num_batches = 0
 
-            # Static C and static scalar a, b
-            C = self.C()
-            a, b = self.ab()
+            with torch.no_grad():
+                for batch_returns in val_loader:
+                    batch_returns = batch_returns.to(next(self.model.parameters()).device)
 
-            # Dynamic C_t
-            C_t_all = self.C_dynamic(returns)
+                    try:
+                        _, loss = self.model(batch_returns)
+                        total_loss += loss.item()
+                        num_batches += 1
+                    except Exception as e:
+                        print(f"Error in validation batch: {e}")
+                        continue
+                
+            return total_loss / max(num_batches, 1)
 
-            # Initialize H_0
-            if init_cov_matrix is None:
-                cov = torch.cov(returns.T)
-                cov = cov + config.jitter * torch.eye(
-                    n_assets,
-                    dtype=torch.float64,
-                    device=device
-                )
-                prev_cov_matrix = cov
-            else:
-                prev_cov_matrix = init_cov_matrix.to(device=device, dtype=torch.float64)
+        def train(self, train_loader, val_loader, epochs=100, patience=20):
+            """Train the LSTM-BEKK model"""
             
-            cov_matrix_list = []
-            nll_terms = []
+            best_val_loss = float("inf")
+            patience_counter = 0
+            train_losses = []
+            val_losses = []
 
-            eye_assets = torch.eye(n_assets, dtype=torch.float64, device=device)
+            print("Starting LSTM-BEKK training...")
+            a_param, b_param = self.model.get_bekk_params()
+            print(f"Model parameters: a = {a_param:.4f}, b = {b_param:.4f}")
 
-            for t in range(n_periods):
-                prev_returns = returns[t-1].unsqueeze(0).T if t>0 else torch.zeros(n_assets, 1, dtype=torch.float64, device=device)
-                C_t = C_t_all[t]
+            for epoch in range(epochs):
+                # Training
+                train_loss = self.train_epoch(train_loader)
+                train_losses.append(train_loss)
 
-                C_static = C @ C.T
-                C_dynamic = C_t @ C_t.T
-                arch = a * (prev_returns @ prev_returns.T)
-                garch = b * prev_cov_matrix
+                # Validation
+                val_loss = self.validate(val_loader)
+                val_losses.append(val_loss)
 
-                cov_matrix = C_static + C_dynamic + arch + garch
+                # Learning rate scheduling
+                self.scheduler.step(val_loss)
 
-                # Stabilize for Cholesky
-                # NOTE wtf is this? -==========================
-                cov_matrix = cov_matrix + config.jitter * eye_assets
-
-                # Cholesky-based log-likelihood
-                L = torch.linalg.cholesky(cov_matrix)
-                logdet = 2.0 * torch.log(torch.diag(L)).sum()
-
-                # Solve H^{-1}*r via 2 triangular solves
-                returns_t = returns[t].unsqueeze(0).T
-                y = torch.cholesky_solve(returns_t, L) # Solves H*y=r
-                quad = (returns_t.T @ y).squeeze() # r' * H^{t-1} * r
-
-                nll_t = 0.5 * (logdet + quad)
-                nll_terms.append(nll_t)
-                cov_matrix_list.append(cov_matrix)
-
-                prev_cov_matrix = cov_matrix
-            
-            cov_matrices = torch.stack(cov_matrix_list, dim=0)
-            nll_terms = torch.stack(nll_terms, dim=0)
-            
-
-            return cov_matrices, nll_terms, C_t_all
-        
-        def negative_loglik(
-                self, 
-                returns: torch.Tensor,
-                lambda_reg: float = 0.0,
-                tau: Optional[float] = None
-            ) -> torch.Tensor:
-
-            _, nll_terms, C_t_all = self.forward_sequence(returns, init_cov_matrix=self.H0_)
-            nll = nll_terms.sum()
-
-            if lambda_reg > 0.0 and tau is not None:
-                reg_terms = []
-                for C_t in C_t_all:
-                    C_tC_t_trace = torch.trace(C_t @ C_t.T)
-                    reg_terms.append(torch.relu(C_tC_t_trace - tau)**2)
-                reg_penalty = torch.stack(reg_terms).mean()
-                nll = nll + lambda_reg * reg_penalty
-            
-            return nll
-
-        
-        def fit(
-                self,
-                returns_df: pd.DataFrame,
-                verbose: bool = True
-        ) -> Dict[str, float]:
-            """
-            Fit the model by minimizing the Gaussian negative log-likelihood
-            returns_df: TxM of demeaned returns
-            """
-
-            config = self.config
-            device = config.device
-
-            returns_np = returns_df.to_numpy(dtype=float)
-            returns_tensor = LSTM_BEKK_MODEL.to_tensor(returns_np, device=device)
-            n_periods = returns_tensor.shape[0]
-
-            # split train, valuate set
-            t_valuate = max(1, int(math.floor(config.val_split * n_periods)))
-            t_train = n_periods - t_valuate
-            r_train = returns_tensor[:t_train]
-            r_valuate = returns_tensor[t_train:]
-
-            # set H_0 from training sample
-            cov = torch.cov(r_train.T)
-            cov = cov + config.jitter * torch.eye(
-                self.n_assets,
-                dtype=torch.float64,
-                device=device
-            )
-            # self.init_cov_matrix = cov.detach()
-            self.H0_ = cov.detach()
-
-            params = list(self.parameters())
-            opt = RMSprop(params, lr=config.lr, weight_decay=config.weight_decay)
-            best_val = float("inf")
-            best_state = None
-            patience = config.early_stopping_patience
-            epochs_no_improve = 0
-
-            for epoch in range(config.epochs):
-                self.train()
-                opt.zero_grad(set_to_none=True)
-                if epoch == 0:
-                    tau = torch.trace(torch.cov(r_train.T)).item()
-                nll = self.negative_loglik(r_train, lambda_reg=1e-3, tau=tau)
-                nll.backward()
-                if config.grad_clip is not None and config.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.parameters(), config.grad_clip)
-                opt.step()
-
-                # Evaluate on validation
-                self.eval()
-                with torch.no_grad():
-                    val_nll = self.negative_loglik(r_valuate).item()
-
-                if verbose and (epoch % 10 == 0 or epoch == config.epochs-1):
-                    print(f"[{epoch:04d}] train NLL : {nll.item():.3f} | val NLL : {val_nll:.3f}")
+                print(f"Epoch {epoch + 1}/{epochs}: Train loss = {train_loss:.6f}; Val loss = {val_loss:.6f}")
 
                 # Early stopping
-                if val_nll + 1e-9 < best_val:
-                    best_val = val_nll
-                    best_state = {
-                        k: v.detach().clone() for k, v in self.state_dict().items()
-                    }
-                    epochs_no_improve = 0
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    torch.save(self.model.state_dict(), "best_lstm_bekk_model.pth")
                 else:
-                    epochs_no_improve += 1
-                    if epochs_no_improve >= patience:
-                        if verbose:
-                            print(f"Early stopping at epoch {epoch}, best val NLL: {best_val:.3f}")
-                        break
-            
-            # Restore best
-            if best_state is not None:
-                self.load_state_dict(best_state)
+                    patience_counter += 1
 
-            return {"best_val_nll":best_val}
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch + 1}")
+                    break
 
-        @torch.no_grad()
-        def covariance(self, returns_df: pd.DataFrame) -> np.ndarray:
-            """
-            Compute fitted covariance matrix for the full series
-            Args:
-                returns_df: demeaned returns
-            Output:
-                array of shape (n_periods, n_assets, n_assets)
-            """
-            returns_np = returns_df.to_numpy(dtype=float)
-            returns_tensor = LSTM_BEKK_MODEL.to_tensor(returns_np, self.config.device)
-            returns_tensor = LSTM_BEKK_MODEL.to_tensor(returns_np, self.config.device)
-            cov_matrix, _, _ = self.forward_sequence(returns_tensor, init_cov_matrix=self.H0_)
-            return cov_matrix.cpu().numpy()
+            # Load best model
+            self.model.load_state_dict(torch.load('best_lstm_bekk_model.pth'))
+            print("Training completed!")
+
+            return train_losses, val_losses
         
-        def get_params(self) -> Dict[str, torch.Tensor]:
-            a, b = self.ab()
-            return {
-                "C_static":self.C().detach().cpu(),
-                "a": a.detach().cpu(),
-                "b": b.detach().cpu(),
-                "beta_swish":self.C_dynamic.beta.detach().cpu()
-            }
-
-        @torch.no_grad()
-        def forecast_one_step(
-            self,
-            last_returns: np.ndarray,
-            last_cov: np.ndarray
-        ) -> np.ndarray:
-            """
-            One-step ahead forecast with r_T and H_T
-            Args: 
-                last_returns: shape (n_assets, )
-                last_cov: shape (n_assets, n_assets) (H_T)
-            """
-            device = self.config.device
-            returns = LSTM_BEKK_MODEL.to_tensor(last_returns.reshape(1, -1), device)
-            C = self.C()
-            a, b = self.ab()
-            C_dynamic = self.C_dynamic(returns)[0]
-
-            cov_matrix_forecast = C @ C.T + C_dynamic @ C_dynamic.T + a * (returns @ returns.T) + b * LSTM_BEKK_MODEL.to_tensor(last_cov, device)
-            cov_matrix_forecast = cov_matrix_forecast + self.config.jitter * torch.eye(self.n_assets, dtype=torch.float64, device=device)
-
-            return cov_matrix_forecast.cpu().numpy()
         
-        @torch.no_grad()
-        def forecast_multi_step(
-            self,
-            last_returns: np.ndarray,
-            last_cov: np.ndarray,
-            steps: int = 20,
-            method: str = "zero"
-        ) -> np.ndarray:
-            """
-            Args:
-                method:
-                - "zero": feed zeros for future returns
-                - "simulate": simulate paths of future returns
-            """
-            device = self.config.device
-            n_assets = self.n_assets
-            forecasts = []
-
-            r_curr = LSTM_BEKK_MODEL.to_tensor(last_returns.reshape(1, -1), device)
-            H_curr = LSTM_BEKK_MODEL.to_tensor(last_cov, device)
-
-            for step in range(steps):
-                C = self.C()
-                a, b = self.ab()
-                
-                # Dynamic C
-                C_t = self.C_dynamic(r_curr)[0]
-
-                if method == "zero" and step > 0:
-                    arch = torch.zeros(
-                        n_assets, n_assets, dtype=torch.float64, device=device
-                    )
-                else:
-                    arch = a * (r_curr.T @ r_curr)
-
-                H_next = C @ C.T + C_t @ C_t.T + arch + b * H_curr
-                H_next = H_next + self.config.jitter * torch.eye(n_assets, dtype=torch.float64, device=device)
-
-                forecasts.append(H_next.cpu().numpy())
-
-                # Update for next iteration
-                H_curr = H_next
-                if method == "zero":
-                    r_curr = torch.zeros_like(r_curr) # feed zeros
-                elif method == "simulate":
-                    # sample one return path
-                    L = torch.linalg.cholesky(H_next)
-                    z = torch.randn(n_assets, 1, dtype=torch.float64, device=device)
-                    r_curr = (L @ z).T 
-            
-            return np.stack(forecasts, axis=0)
-        
-    def fit_lstm_bekk(
-            returns_df: pd.DataFrame,
-            hidden_size: Optional[int] = None,
-            num_layers: int = 1,
-            dropout: float = 0.1,
-            lr: float = 0.001,
-            epochs: int = 500,
-            device: str = "cpu"
-    ) -> LSTM_BEKK:
-        n_assets = returns_df.shape[1]
-        config = LSTM_BEKK_MODEL.LSTM_BEKK_config(
-            hidden_size=hidden_size,
-            num_layers=num_layers,
-            dropout=dropout,
-            lr=lr,
-            epochs=epochs,
-            device=device
-        )
-        model = LSTM_BEKK_MODEL.LSTM_BEKK(n_assets=n_assets, config=config)
-        model.fit(returns_df, verbose=True)
-
-        return model
-    
-    @staticmethod
-    def load_model(
-        path: str, 
-        n_assets: int, 
-        config: Optional["LSTM_BEKK_MODEL.LSTM_BEKK_config"]=None
-    ):
-        model = LSTM_BEKK_MODEL.LSTM_BEKK(n_assets=n_assets, config=config)
-        state_dict = torch.load(path, map_location=config.device if config else "cpu")
-        model.load_state_dict(state_dict)
+    def evaluate_model(model, test_loader):
+        """Evaluate model on test data"""
         model.eval()
-        return model
+        total_nll = 0.0
+        num_batches = 0
+
+        with torch.no_grad():
+            for batch_returns in test_loader:
+                batch_returns = batch_returns.to(next(model.parameters()).device)
+
+                try:
+                    _, nll = model(batch_returns)
+                    total_nll += nll.item()
+                    num_batches += 1 
+                except Exception as e:
+                    print(f"Error in evaluation: {e}")
+                    continue
+                    
+        avg_nll = total_nll / max(num_batches, 1)
+        return avg_nll
 
     
 class BEKK_GARCH_MODEL:
@@ -552,7 +473,15 @@ class BEKK_GARCH_MODEL:
 
         for t in range(n_periods):
             residual = returns[t].reshape(-1, 1)
-            cov_matrix = C@C.T + A@(residual@residual.T)@A.T + B@cov_matrix@B.T
+            cov_matrix = C @ C.T + A @ (residual @ residual.T) @ A.T + B @ cov_matrix @ B.T
+            
+            # Check for numerical overflow
+            if np.any(np.isinf(cov_matrix)) or np.any(np.isnan(cov_matrix)):
+                return np.inf
+            
+            if np.linalg.norm(cov_matrix, 'fro') > 1e15:
+                return np.inf
+
             sign, logdet = np.linalg.slogdet(cov_matrix)
 
             if sign <= 0:
@@ -561,17 +490,26 @@ class BEKK_GARCH_MODEL:
         
         return loglikelihood.flatten()[0]
 
-    def fit_bekk(returns):
+    def fit_bekk(returns, x0):
         n_periods, n_assets = returns.shape
-        nC = n_assets * (n_assets+1) // 2
-        n_params = nC + 2*n_assets*n_assets
-        x0 = 0.05 * np.random.randn(n_params) # initialize first value
+
+        def stability_constraint(params, n_assets):
+            _, A, B = BEKK_GARCH_MODEL.unpack_params(params, n_assets)
+            stability_matrix = A @ A.T + B @ B.T
+            max_eigenvalue = np.max(np.linalg.eigvals(stability_matrix))
+
+            return 1 - max_eigenvalue
 
         bekk = minimize(
             BEKK_GARCH_MODEL.bekk_loglikelihood, x0,
             args=(returns,),
-            method="L-BFGS-B",
-            options={"maxiter":500}
+            method="SLSQP",
+            options={"maxiter":500},
+            constraints= [{
+                'type':'ineq',
+                'fun':stability_constraint,
+                'args':(n_assets,)
+            }]
         )
 
         C, A, B = BEKK_GARCH_MODEL.unpack_params(bekk.x, n_assets)
@@ -588,8 +526,13 @@ class BEKK_GARCH_MODEL:
         forecasts.append(cov_matrix_f1) # Use actual shocks
 
         prev_cov_matrix = cov_matrix_f1.copy()
+        
         for t in range(2, horizon+1):
             cov_matrix_t = C @ C.T + (A @ A.T + B @ B.T) @ prev_cov_matrix
+
+            # Bound the values to prevent explosion
+            cov_matrix_t = np.clip(cov_matrix_t, -1e10, 1e10)
+
             forecasts.append(cov_matrix_t)
             prev_cov_matrix = cov_matrix_t
         

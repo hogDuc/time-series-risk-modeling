@@ -102,3 +102,32 @@ def sharpe_ratio(
     sharpe = (mean_return - rf_rate)/volatility
 
     return sharpe
+
+
+def get_rolling_realized_covariance(returns, window_size=1000):
+    """
+    Calculates a rolling realized covariance matrix from daily returns.
+    
+    Args:
+        returns (np.ndarray): Daily returns with shape (n_periods, n_assets).
+        window_size (int): The number of days to average the outer products over.
+        
+    Returns:
+        np.ndarray: A series of realized covariance matrices with shape
+                    (n_periods - window_size, n_assets, n_assets).
+    """
+    n_periods, n_assets = returns.shape
+    realized_covs = []
+
+    for i in range(window_size, n_periods):
+        # Rolling window of returns
+        window = returns[i - window_size : i]
+        
+        # Calculate the outer product for each day in the window
+        outer_products = np.array([np.outer(r, r) for r in window])
+        
+        # Average the outer products to get the realized covariance for day i
+        realized_cov = np.mean(outer_products, axis=0)
+        realized_covs.append(realized_cov)
+        
+    return np.array(realized_covs)
