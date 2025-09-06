@@ -46,7 +46,7 @@ class LSTM_BEKK_MODEL:
                 dropout: Dropout rate for regularization. Recommended 0.1-0.2
                 beta: Swish activation parameter
             """
-            super(LSTM_BEKK_MODEL.LSTMBEKKModel, self).__init__()
+            super().__init__()
 
             self.n_assets = n_assets
             self.hidden_size = hidden_size or n_assets
@@ -298,13 +298,13 @@ class LSTM_BEKK_MODEL:
         
         def __init__(self, model, learning_rate=0.001, weight_decay=1e-5):
             self.model = model
-            self.optimizer = LSTM_BEKK_MODEL.optim.RMSprop(
+            self.optimizer = optim.RMSprop(
                 model.parameters(),
                 lr=learning_rate,
                 weight_decay=weight_decay,
                 eps=1e-8
             )
-            self.scheduler = LSTM_BEKK_MODEL.optim.lr_scheduler.ReduceLROnPlateau(
+            self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
                 self.optimizer,
                 mode='min',
                 factor=0.5,
