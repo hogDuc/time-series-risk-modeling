@@ -1,8 +1,10 @@
 import torch
 import random
 import math
+import pandas as pd
 import numpy as np
 from scipy.optimize import minimize
+from sklearn.covariance import ledoit_wolf
 
 def set_seed(seed=1):
     torch.manual_seed(seed)
@@ -95,16 +97,41 @@ def minimum_variance_portfolio(covariance_matrix, data):
 
 def sharpe_ratio(
     returns: np.array,
-    rf_rate = 0.032 # Risk-free rate
+    rf_rate = 0.032, # Risk-free rate
+    horizon = 10 # Holding period
 ):
+    periods_per_year = 252 / horizon
     mean_return = np.mean(returns)
-    volatility = np.std(returns, ddof=1)
-    sharpe = (mean_return - rf_rate)/volatility
+    volatility = np.std(returns)
 
-    return sharpe
+    # Convert risk-free rate to horizon risk-free rate
+    rf = (1 + rf_rate) ** (horizon / 252) - 1
+
+    excess_r_ann = (mean_return - rf) * periods_per_year
+    vol_ann = volatility * np.sqrt(periods_per_year)
+    
+    if vol_ann == 0: # In case division by 0
+        return 0.0
+
+    return excess_r_ann / vol_ann
+
+def ledoit_wolf_estimate(returns_df, horizon):
+
+    n_days = len(returns_df)
+    lw_matrices = []
+
+    for period in range(0, n_days, horizon):
+        window = returns_df[period:(period + horizon)]
+        if len(window) == 1:
+            lw_cov = np.outer(window, window)
+        else:
+            lw_cov, _ = ledoit_wolf(window)
+        lw_matrices.append(lw_cov)
+    
+    return lw_matrices
 
 
-def get_rolling_realized_covariance(returns, window_size=1000):
+def get_rolling_realized_covariance(returns, window_size=1000, ledoitwolf=False):
     """
     Calculates a rolling realized covariance matrix from daily returns.
     
@@ -124,10 +151,14 @@ def get_rolling_realized_covariance(returns, window_size=1000):
         window = returns[i - window_size : i]
         
         # Calculate the outer product for each day in the window
-        outer_products = np.array([np.outer(r, r) for r in window])
-        
-        # Average the outer products to get the realized covariance for day i
-        realized_cov = np.mean(outer_products, axis=0)
+        if ledoitwolf:
+            realized_cov = ledoit_wolf(window)[0] 
+        else:
+            outer_products = np.array([np.outer(r, r) for r in window])
+            
+            # Average the outer products to get the realized covariance for day i
+            realized_cov = np.mean(outer_products, axis=0)
         realized_covs.append(realized_cov)
         
     return np.array(realized_covs)
+
