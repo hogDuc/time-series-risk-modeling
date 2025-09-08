@@ -85,8 +85,8 @@ def minimum_variance_portfolio(covariance_matrix, data):
         constraints={
             "type":'eq',
             "fun":weights_constraints,
-            'method':"SLSQP"
-        }
+        },
+        method="SLSQP"
     )
 
     return optimal_weights.x, {
